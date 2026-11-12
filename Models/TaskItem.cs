@@ -1,5 +1,4 @@
-﻿
-namespace TaskApi.Models;
+﻿namespace TaskApi.Models;
 
 public class TaskItem
 {
@@ -16,4 +15,9 @@ public class TaskItem
     public DateTime? DueDate { get; set; }
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    // Task ownership
+    public string OwnerId { get; set; } = string.Empty;
+
+    public ApplicationUser Owner { get; set; } = null!;
 }

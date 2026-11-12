@@ -1,9 +1,8 @@
-﻿
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
+using TaskApi.Data;
 using TaskApi.DTOs.Common;
 using TaskApi.DTOs.Tasks;
 using TaskApi.Models;
-using TaskApi.Data;
 
 namespace TaskApi.Services;
 
@@ -22,35 +21,21 @@ public class TaskService : ITaskService
 
     public async Task<PagedResponse<TaskResponseDto>> GetAllAsync(
         TaskQueryParameters parameters,
+        string userId,
+        bool includeAll,
         CancellationToken cancellationToken = default)
     {
-        if (parameters.PageNumber < 1)
-        {
-            throw new ArgumentException(
-                "Page number must be at least 1.");
-        }
-
-        if (parameters.PageSize is < 1 or > 100)
-        {
-            throw new ArgumentException(
-                "Page size must be between 1 and 100.");
-        }
-
-        if (parameters.Status.HasValue &&
-            !Enum.IsDefined(parameters.Status.Value))
-        {
-            throw new ArgumentException("Invalid task status.");
-        }
-
-        if (parameters.Priority.HasValue &&
-            !Enum.IsDefined(parameters.Priority.Value))
-        {
-            throw new ArgumentException("Invalid task priority.");
-        }
+        ValidateQuery(parameters);
 
         var query = _context.Tasks
             .AsNoTracking()
             .AsQueryable();
+
+        // Ownership filtering
+        if (!includeAll)
+        {
+            query = query.Where(t => t.OwnerId == userId);
+        }
 
         // Filtering
         if (parameters.Status.HasValue)
@@ -84,7 +69,8 @@ public class TaskService : ITaskService
                 "SortBy must be 'createdAt' or 'dueDate'.")
         };
 
-        var totalCount = await query.CountAsync(cancellationToken);
+        var totalCount = await query.CountAsync(
+            cancellationToken);
 
         var items = await query
             .Skip((parameters.PageNumber - 1) * parameters.PageSize)
@@ -110,13 +96,28 @@ public class TaskService : ITaskService
         };
     }
 
-    public async Task<TaskResponseDto?> GetByIdAsync(
+    public async Task<TaskItem?> GetResourceByIdAsync(
         int id,
         CancellationToken cancellationToken = default)
     {
         return await _context.Tasks
             .AsNoTracking()
-            .Where(t => t.Id == id)
+            .FirstOrDefaultAsync(
+                t => t.Id == id,
+                cancellationToken);
+    }
+
+    public async Task<TaskResponseDto?> GetByIdAsync(
+        int id,
+        string userId,
+        bool isAdmin,
+        CancellationToken cancellationToken = default)
+    {
+        return await _context.Tasks
+            .AsNoTracking()
+            .Where(t =>
+                t.Id == id &&
+                (isAdmin || t.OwnerId == userId))
             .Select(t => new TaskResponseDto
             {
                 Id = t.Id,
@@ -132,37 +133,34 @@ public class TaskService : ITaskService
 
     public async Task<TaskResponseDto> CreateAsync(
         CreateTaskDto dto,
+        string ownerId,
         CancellationToken cancellationToken = default)
     {
         ValidateTitle(dto.Title);
-
-        if (dto.Priority is null ||
-            !Enum.IsDefined(dto.Priority.Value))
-        {
-            throw new ArgumentException("Invalid task priority.");
-        }
-
-        if (dto.Status is null ||
-            !Enum.IsDefined(dto.Status.Value))
-        {
-            throw new ArgumentException("Invalid task status.");
-        }
+        ValidatePriority(dto.Priority);
+        ValidateStatus(dto.Status);
 
         var entity = new TaskItem
         {
             Title = dto.Title.Trim(),
             Description = NormalizeDescription(dto.Description),
-            Priority = dto.Priority.Value,
-            Status = dto.Status.Value,
+            Priority = dto.Priority!.Value,
+            Status = dto.Status!.Value,
             DueDate = dto.DueDate,
-            CreatedAt = DateTime.UtcNow
+            CreatedAt = DateTime.UtcNow,
+
+            // Never accept OwnerId from the request body.
+            OwnerId = ownerId
         };
 
         _context.Tasks.Add(entity);
+
         await _context.SaveChangesAsync(cancellationToken);
 
         _logger.LogInformation(
-            "Created task {TaskId}", entity.Id);
+            "Created task {TaskId} for user {UserId}",
+            entity.Id,
+            ownerId);
 
         return MapToResponse(entity);
     }
@@ -170,68 +168,94 @@ public class TaskService : ITaskService
     public async Task<TaskResponseDto?> UpdateAsync(
         int id,
         UpdateTaskDto dto,
+        string userId,
+        bool isAdmin,
         CancellationToken cancellationToken = default)
     {
         ValidateTitle(dto.Title);
-
-        if (dto.Priority is null ||
-            !Enum.IsDefined(dto.Priority.Value))
-        {
-            throw new ArgumentException("Invalid task priority.");
-        }
-
-        if (dto.Status is null ||
-            !Enum.IsDefined(dto.Status.Value))
-        {
-            throw new ArgumentException("Invalid task status.");
-        }
+        ValidatePriority(dto.Priority);
+        ValidateStatus(dto.Status);
 
         var entity = await _context.Tasks
             .FirstOrDefaultAsync(
-                t => t.Id == id,
+                t => t.Id == id &&
+                     (isAdmin || t.OwnerId == userId),
                 cancellationToken);
 
         if (entity is null)
-        {
             return null;
-        }
 
         entity.Title = dto.Title.Trim();
         entity.Description = NormalizeDescription(dto.Description);
-        entity.Priority = dto.Priority.Value;
-        entity.Status = dto.Status.Value;
+        entity.Priority = dto.Priority!.Value;
+        entity.Status = dto.Status!.Value;
         entity.DueDate = dto.DueDate;
 
-        // Do not change Id or CreatedAt during an update.
+        // OwnerId, Id and CreatedAt cannot be changed.
+
         await _context.SaveChangesAsync(cancellationToken);
 
         _logger.LogInformation(
-            "Updated task {TaskId}", entity.Id);
+            "Updated task {TaskId} by user {UserId}",
+            id,
+            userId);
 
         return MapToResponse(entity);
     }
 
     public async Task<bool> DeleteAsync(
         int id,
+        string userId,
+        bool isAdmin,
         CancellationToken cancellationToken = default)
     {
         var entity = await _context.Tasks
             .FirstOrDefaultAsync(
-                t => t.Id == id,
+                t => t.Id == id &&
+                     (isAdmin || t.OwnerId == userId),
                 cancellationToken);
 
         if (entity is null)
-        {
             return false;
-        }
 
         _context.Tasks.Remove(entity);
+
         await _context.SaveChangesAsync(cancellationToken);
 
         _logger.LogInformation(
-            "Deleted task {TaskId}", id);
+            "Deleted task {TaskId} by user {UserId}",
+            id,
+            userId);
 
         return true;
+    }
+
+    private static void ValidateQuery(
+        TaskQueryParameters parameters)
+    {
+        if (parameters.PageNumber < 1)
+        {
+            throw new ArgumentException(
+                "Page number must be at least 1.");
+        }
+
+        if (parameters.PageSize is < 1 or > 100)
+        {
+            throw new ArgumentException(
+                "Page size must be between 1 and 100.");
+        }
+
+        if (parameters.Status.HasValue &&
+            !Enum.IsDefined(parameters.Status.Value))
+        {
+            throw new ArgumentException("Invalid task status.");
+        }
+
+        if (parameters.Priority.HasValue &&
+            !Enum.IsDefined(parameters.Priority.Value))
+        {
+            throw new ArgumentException("Invalid task priority.");
+        }
     }
 
     private static void ValidateTitle(string? title)
@@ -249,14 +273,34 @@ public class TaskService : ITaskService
         }
     }
 
-    private static string? NormalizeDescription(string? description)
+    private static void ValidatePriority(TaskPriority? priority)
+    {
+        if (priority is null ||
+            !Enum.IsDefined(priority.Value))
+        {
+            throw new ArgumentException("Invalid task priority.");
+        }
+    }
+
+    private static void ValidateStatus(TaskStatuss? status)
+    {
+        if (status is null ||
+            !Enum.IsDefined(status.Value))
+        {
+            throw new ArgumentException("Invalid task status.");
+        }
+    }
+
+    private static string? NormalizeDescription(
+        string? description)
     {
         return string.IsNullOrWhiteSpace(description)
             ? null
             : description.Trim();
     }
 
-    private static TaskResponseDto MapToResponse(TaskItem entity)
+    private static TaskResponseDto MapToResponse(
+        TaskItem entity)
     {
         return new TaskResponseDto
         {
