@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using TaskApi.DTOs.Auth;
 using TaskApi.Services;
 
@@ -63,6 +64,7 @@ public class AuthController : ControllerBase
     }
 
     [HttpPost("login")]
+    [EnableRateLimiting("Login")]
     public async Task<IActionResult> Login(
         [FromBody] LoginRequestDto dto,
         CancellationToken cancellationToken)
