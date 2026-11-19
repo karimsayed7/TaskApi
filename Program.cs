@@ -4,6 +4,8 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
+using System.Threading.RateLimiting;
+using TaskApi.Services.Security;
 using TaskApi.Authorization;
 using TaskApi.Data;
 using TaskApi.Middleware;
@@ -232,6 +234,92 @@ builder.Services.AddCors(options =>
     });
 });
 
+
+// --------------------------------------------------
+// Rate Limiting
+// --------------------------------------------------
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode =
+        StatusCodes.Status429TooManyRequests;
+
+    // --------------------------------------------------
+    // Global Token Bucket - Per IP
+    // --------------------------------------------------
+
+    options.GlobalLimiter =
+        PartitionedRateLimiter.Create<HttpContext, string>(
+            httpContext =>
+                RateLimitPartition.GetTokenBucketLimiter(
+                    partitionKey: GetClientIp(httpContext),
+                    factory: _ => new TokenBucketRateLimiterOptions
+                    {
+                        TokenLimit = 60,
+                        TokensPerPeriod = 5,
+                        ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+                        AutoReplenishment = true,
+                        QueueLimit = 0
+                    }));
+
+    // --------------------------------------------------
+    // Login Sliding Window - Per IP
+    // --------------------------------------------------
+
+    options.AddPolicy("Login", httpContext =>
+        RateLimitPartition.GetSlidingWindowLimiter(
+            partitionKey: GetClientIp(httpContext),
+            factory: _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(5),
+                SegmentsPerWindow = 5,
+                AutoReplenishment = true,
+                QueueLimit = 0
+            }));
+
+    // --------------------------------------------------
+    // Rejection Handling
+    // --------------------------------------------------
+
+    options.OnRejected = async (context, cancellationToken) =>
+    {
+        var logger = context.HttpContext.RequestServices
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger("TaskApi.Security.RateLimiting");
+
+        var ip = GetClientIp(context.HttpContext);
+
+        var path = context.HttpContext.Request.Path;
+
+        logger.LogWarning(
+            "Rate limit exceeded. IP: {ClientIp}, Path: {Path}",
+            ip,
+            path);
+
+        if (context.Lease.TryGetMetadata(
+            MetadataName.RetryAfter,
+            out var retryAfter))
+        {
+            context.HttpContext.Response.Headers.RetryAfter =
+                Math.Max(
+                    1,
+                    (int)Math.Ceiling(retryAfter.TotalSeconds))
+                .ToString();
+        }
+
+        context.HttpContext.Response.ContentType =
+            "application/json";
+
+        await context.HttpContext.Response.WriteAsJsonAsync(
+            new
+            {
+                message = "Too many requests. Please try again later."
+            },
+            cancellationToken);
+    };
+});
+
 // --------------------------------------------------
 // Application Services
 // --------------------------------------------------
@@ -241,6 +329,18 @@ builder.Services.AddScoped<ITaskService, TaskService>();
 builder.Services.AddScoped<IAuthService, AuthService>();
 
 builder.Services.AddScoped<ITokenService, TokenService>();
+
+// Security monitoring dependencies.
+builder.Services.AddMemoryCache(options =>
+{
+    options.SizeLimit = 10_000;
+});
+
+builder.Services.AddHttpContextAccessor();
+
+builder.Services.AddSingleton<
+    ILoginSecurityMonitor,
+    LoginSecurityMonitor>();
 
 // --------------------------------------------------
 // Build
@@ -263,7 +363,11 @@ app.UseMiddleware<GlobalExceptionMiddleware>();
 
 app.UseHttpsRedirection();
 
+app.UseRouting();
+
 app.UseCors("Frontend");
+
+app.UseRateLimiter();
 
 app.UseAuthentication();
 
@@ -281,3 +385,15 @@ if (app.Environment.IsDevelopment())
 app.MapControllers();
 
 app.Run();
+
+static string GetClientIp(HttpContext context)
+{
+    var ip = context.Connection.RemoteIpAddress;
+
+    if (ip is null)
+        return "unknown";
+
+    return ip.IsIPv4MappedToIPv6
+        ? ip.MapToIPv4().ToString()
+        : ip.ToString();
+}

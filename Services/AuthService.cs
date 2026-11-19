@@ -8,6 +8,7 @@ using TaskApi.DTOs.Auth;
 using TaskApi.Models;
 using TaskApi.Options;
 using System.Data;
+using TaskApi.Services.Security;
 namespace TaskApi.Services;
 
 public class AuthService : IAuthService
@@ -17,19 +18,25 @@ public class AuthService : IAuthService
     private readonly TaskApiDbContext _context;
     private readonly ITokenService _tokenService;
     private readonly RefreshTokenOptions _refreshOptions;
+    private readonly ILoginSecurityMonitor _securityMonitor;
+    private readonly IHttpContextAccessor _httpContextAccessor;
 
     public AuthService(
         UserManager<ApplicationUser> userManager,
         SignInManager<ApplicationUser> signInManager,
         TaskApiDbContext context,
         ITokenService tokenService,
-        IOptions<RefreshTokenOptions> refreshOptions)
+        IOptions<RefreshTokenOptions> refreshOptions,
+        ILoginSecurityMonitor securityMonitor,
+        IHttpContextAccessor httpContextAccessor)
     {
         _userManager = userManager;
         _signInManager = signInManager;
         _context = context;
         _tokenService = tokenService;
         _refreshOptions = refreshOptions.Value;
+        _securityMonitor = securityMonitor;
+        _httpContextAccessor = httpContextAccessor;
     }
 
     public async Task<IdentityResult> RegisterAsync(
@@ -66,22 +73,52 @@ public class AuthService : IAuthService
     }
 
     public async Task<AuthSession?> LoginAsync(
-        LoginRequestDto dto,
-        CancellationToken cancellationToken = default)
+    LoginRequestDto dto,
+    CancellationToken cancellationToken = default)
     {
-        var user = await _userManager.FindByEmailAsync(
-            dto.Email.Trim());
+        var clientIp = GetClientIpAddress();
 
+        var email = dto.Email.Trim();
+
+        var user = await _userManager.FindByEmailAsync(email);
+
+        // Account does not exist.
         if (user is null)
+        {
+            _securityMonitor.RecordFailedLogin(
+                email,
+                clientIp,
+                "UnknownAccount");
+
             return null;
+        }
 
         var result = await _signInManager.CheckPasswordSignInAsync(
             user,
             dto.Password,
             lockoutOnFailure: true);
 
+        // Login failed.
         if (!result.Succeeded)
+        {
+            var failureReason = result.IsLockedOut
+                ? "AccountLockedOut"
+                : result.IsNotAllowed
+                    ? "LoginNotAllowed"
+                    : "InvalidCredentials";
+
+            _securityMonitor.RecordFailedLogin(
+                email,
+                clientIp,
+                failureReason);
+
             return null;
+        }
+
+        // Login succeeded.
+        _securityMonitor.RecordSuccessfulLogin(
+            email,
+            clientIp);
 
         return await CreateSessionAsync(
             user,
@@ -277,5 +314,20 @@ public class AuthService : IAuthService
             Encoding.UTF8.GetBytes(token));
 
         return Convert.ToHexString(hash);
+    }
+
+    private string GetClientIpAddress()
+    {
+        var ip = _httpContextAccessor
+            .HttpContext?
+            .Connection
+            .RemoteIpAddress;
+
+        if (ip is null)
+            return "unknown";
+
+        return ip.IsIPv4MappedToIPv6
+            ? ip.MapToIPv4().ToString()
+            : ip.ToString();
     }
 }
