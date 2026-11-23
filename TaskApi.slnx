@@ -5,5 +5,4 @@
     <Project Path="src/TaskApi.Domain/TaskApi.Domain.csproj" />
     <Project Path="src/TaskApi.Infrastructure/TaskApi.Infrastructure.csproj" />
   </Folder>
-  <Project Path="TaskApi.csproj" />
 </Solution>
